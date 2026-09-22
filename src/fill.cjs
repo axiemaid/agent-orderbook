@@ -103,9 +103,8 @@ async function fill() {
   console.log()
 
   // Reconstruct Order covenant from tx
-  const dummyKey = bsv.PrivateKey.fromRandom('mainnet')
   const provider = new DefaultProvider({ network: bsv.Networks.mainnet })
-  const signer = new TestWallet(dummyKey, provider)
+  const signer = new TestWallet(privKey, provider)
   await provider.connect()
 
   const order = Order.fromTx(orderTx, orderOutputIndex)

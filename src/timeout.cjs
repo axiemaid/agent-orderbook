@@ -1,20 +1,18 @@
 #!/usr/bin/env node
-// src/cancel.cjs — CANCEL: maker cancels their own order (covenant spend)
+// src/timeout.cjs — TIMEOUT: maker reclaims order value after expiry + grace period
 //
-// Usage: node src/cancel.cjs --wallet ~/.openclaw/bsv-wallet.json \
+// Usage: node src/timeout.cjs --wallet ~/.openclaw/bsv-wallet.json \
 //          --order-txid <txid>
 //
-// Pre-expiry: 1% penalty burned, rest refunded
-// Post-expiry: full refund, no penalty
+// Must be past expiryHeight + GRACE_BLOCKS (100 blocks)
 
 const fs = require('fs')
 const path = require('path')
-const { bsv, Sig, toByteString, int2ByteString, DefaultProvider, TestWallet } = require('scrypt-ts')
+const { bsv, Sig, toByteString, DefaultProvider, TestWallet } = require('scrypt-ts')
 const { Order } = require('../dist/contracts/order')
 const {
   loadWallet, getKeypair, wocBroadcast, wocGetRaw, getCurrentHeight
 } = require('../lib/wallet.cjs')
-const { decodeOrd1 } = require('../lib/protocol.cjs')
 
 // ─── Args ────────────────────────────────────────────────────────────
 
@@ -27,7 +25,7 @@ const WALLET_PATH = args.wallet || path.join(process.env.HOME, '.openclaw/bsv-wa
 const ORDER_TXID = args['order-txid']
 
 if (!ORDER_TXID) {
-  console.log('Usage: node src/cancel.cjs --wallet <path> --order-txid <txid>')
+  console.log('Usage: node src/timeout.cjs --wallet <path> --order-txid <txid>')
   process.exit(1)
 }
 
@@ -38,8 +36,8 @@ Order.loadArtifact(artifact)
 
 // ─── Main ────────────────────────────────────────────────────────────
 
-async function cancel() {
-  console.log('❌ ORD1 — Cancel Order (Covenant)')
+async function timeout() {
+  console.log('⏰ ORD1 — Timeout (Reclaim Order)')
   console.log(`   Order: ${ORDER_TXID.slice(0, 16)}...`)
   console.log()
 
@@ -65,7 +63,6 @@ async function cancel() {
   console.log(`   Output:  [${orderOutputIndex}] (${maxScriptLen / 2} bytes script)`)
   console.log(`   Value:   ${orderValue} sats`)
 
-  // Check expiry
   const currentHeight = await getCurrentHeight()
 
   // Load covenant
@@ -76,64 +73,45 @@ async function cancel() {
   const order = Order.fromTx(orderTx, orderOutputIndex)
   await order.connect(signer)
 
-  console.log(`   Expiry:  Block ${order.expiryHeight}`)
-  console.log(`   Current: Block ${currentHeight}`)
+  console.log(`   Expiry:    Block ${order.expiryHeight}`)
+  console.log(`   Current:   Block ${currentHeight}`)
 
-  const isExpired = currentHeight >= Number(order.expiryHeight)
-  console.log(`   Status:  ${isExpired ? 'expired (free cancel)' : 'pre-expiry (1% penalty)'}`)
+  // GRACE_BLOCKS = 100 (must match covenant)
+  const graceBlocks = 100n
+  const timeoutHeight = Number(order.expiryHeight + graceBlocks)
+  console.log(`   Timeout at: Block ${timeoutHeight}`)
+
+  if (currentHeight < timeoutHeight) {
+    console.error(`❌ Timeout not yet available (need block ${timeoutHeight}, current ${currentHeight})`)
+    process.exit(1)
+  }
+
+  console.log(`   Status:   Grace period passed — full refund available`)
   console.log()
 
-  // Build cancel tx
-  order.bindTxBuilder('cancel', (current, options, sigArg) => {
+  // Build timeout tx
+  order.bindTxBuilder('timeout', (current, options, sigArg) => {
     const unsignedTx = new bsv.Transaction()
     unsignedTx.addInput(current.buildContractInput())
 
-    // Set locktime for the tx (needed for timeout check)
+    // Set locktime
     unsignedTx.nLockTime = currentHeight
 
-    if (isExpired) {
-      // Post-expiry: full refund to maker
-      unsignedTx.addOutput(new bsv.Transaction.Output({
-        script: bsv.Script.buildPublicKeyHashOut(address),
-        satoshis: orderValue,
-      }))
+    // Output 0: Full refund to maker
+    unsignedTx.addOutput(new bsv.Transaction.Output({
+      script: bsv.Script.buildPublicKeyHashOut(address),
+      satoshis: orderValue,
+    }))
 
-      // OP_RETURN: ORD1 CANCEL
-      const opReturnHex =
-        '006a' +
-        '04' + '4f524431' +
-        '06' + '43414e43454c'
-      unsignedTx.addOutput(new bsv.Transaction.Output({
-        script: bsv.Script.fromHex(opReturnHex),
-        satoshis: 0,
-      }))
-    } else {
-      // Pre-expiry: 1% penalty
-      const penalty = Math.floor(orderValue / 100)
-      const refund = orderValue - penalty
-
-      // Output 0: Refund to maker
-      unsignedTx.addOutput(new bsv.Transaction.Output({
-        script: bsv.Script.buildPublicKeyHashOut(address),
-        satoshis: refund,
-      }))
-
-      // Output 1: Penalty (burn to OP_FALSE OP_RETURN OP_0)
-      unsignedTx.addOutput(new bsv.Transaction.Output({
-        script: bsv.Script.fromHex('006a00'),
-        satoshis: penalty,
-      }))
-
-      // Output 2: OP_RETURN: ORD1 CANCEL
-      const opReturnHex =
-        '006a' +
-        '04' + '4f524431' +
-        '06' + '43414e43454c'
-      unsignedTx.addOutput(new bsv.Transaction.Output({
-        script: bsv.Script.fromHex(opReturnHex),
-        satoshis: 0,
-      }))
-    }
+    // Output 1: OP_RETURN: ORD1 TIMEOUT
+    const opReturnHex =
+      '006a' +
+      '04' + '4f524431' +
+      '07' + '54494d454f5554'
+    unsignedTx.addOutput(new bsv.Transaction.Output({
+      script: bsv.Script.fromHex(opReturnHex),
+      satoshis: 0,
+    }))
 
     return Promise.resolve({
       tx: unsignedTx,
@@ -142,14 +120,13 @@ async function cancel() {
     })
   })
 
-  console.log('   Building cancel transaction...')
+  console.log('   Building timeout transaction...')
 
-  const callResult = await order.methods.cancel(
+  const callResult = await order.methods.timeout(
     (sigResps) => sigResps[0].sig,
     { autoPayFee: false, partiallySigned: true, estimateFee: false }
   )
 
-  // Sign with maker's key
   callResult.tx.sign(privKey)
 
   const txhex = callResult.tx.uncheckedSerialize()
@@ -165,22 +142,22 @@ async function cancel() {
     let orders = JSON.parse(fs.readFileSync(orderFile, 'utf8'))
     const orderEntry = orders.find(o => o.txid === ORDER_TXID)
     if (orderEntry) {
-      orderEntry.status = 'cancelled'
-      orderEntry.cancel_txid = txid
+      orderEntry.status = 'timeout'
+      orderEntry.timeout_txid = txid
       fs.writeFileSync(orderFile, JSON.stringify(orders, null, 2))
     }
   }
 
   console.log()
   console.log('═══════════════════════════════════════════════')
-  console.log(`   ✅ Order cancelled!`)
+  console.log(`   ✅ Order reclaimed (timeout)!`)
   console.log(`   TXID:    ${txid}`)
-  console.log(`   ${isExpired ? 'Full refund (post-expiry)' : `Refund with 1% penalty`}`)
+  console.log(`   Refund:  ${orderValue} sats`)
   console.log(`   https://whatsonchain.com/tx/${txid}`)
   console.log('═══════════════════════════════════════════════')
 }
 
-cancel().catch(err => {
+timeout().catch(err => {
   console.error('❌', err.message)
   process.exit(1)
 })
