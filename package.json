@@ -1,0 +1,29 @@
+{
+  "name": "agent-orderbook",
+  "version": "0.1.0",
+  "description": "ORD1 — Agent-native on-chain orderbook protocol for BSV",
+  "scripts": {
+    "compile": "npx scrypt-cli compile -i contracts/order.ts && npx scrypt-cli compile -i contracts/delivery.ts"
+  },
+  "keywords": [
+    "bsv",
+    "orderbook",
+    "covenant",
+    "scrypt",
+    "agents",
+    "ord1"
+  ],
+  "author": "axiemaid",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "scrypt-cli": "^0.2.3",
+    "scrypt-ts": "^1.4.5",
+    "scrypt-ts-transpiler": "^1.2.29",
+    "ts-node": "^10.9.2",
+    "ts-patch": "^3.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}
