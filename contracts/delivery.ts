@@ -7,6 +7,7 @@ import {
     prop,
     PubKey,
     PubKeyHash,
+    sha256,
     Sig,
     SmartContract,
     toByteString,
@@ -122,6 +123,50 @@ export class Delivery extends SmartContract {
             toByteString('44454c49564552') + // "DELIVER"
             toByteString('01') +
             int2ByteString(proofType, 1n)  // proof type
+        outputs += Utils.buildOutput(opReturnScript, 0n)
+
+        assert(
+            this.ctx.hashOutputs == hash256(outputs),
+            'hashOutputs mismatch'
+        )
+    }
+
+    /**
+     * HASH_LOCK DELIVER — seller reveals preimage that hashes to deliveryHash
+     *
+     * This is the key method for inference tasks:
+     *   1. Buyer locks payment with deliveryHash = sha256(expectedAnswer)
+     *   2. Seller computes the answer, reveals preimage (the answer itself)
+     *   3. Covenant verifies sha256(preimage) == deliveryHash on-chain
+     *   4. Payment released to seller
+     *
+     * The answer is revealed publicly on-chain — anyone can verify it.
+     *
+     * Outputs:
+     *   [0] Payment to seller
+     *   [1] OP_RETURN: ORD1 DELIVER (proofType = HASH_LOCK)
+     */
+    @method()
+    public hashLockDeliver(preimage: ByteString) {
+        // Verify: sha256(preimage) must equal deliveryHash
+        assert(
+            sha256(preimage) == this.deliveryHash,
+            'preimage does not match delivery hash'
+        )
+
+        // Payment to seller
+        let outputs: ByteString =
+            Utils.buildPublicKeyHashOutput(this.sellerPkh, this.ctx.utxo.value)
+
+        // OP_RETURN: ORD1 DELIVER with proof type = HASH_LOCK (2)
+        const opReturnScript: ByteString =
+            toByteString('006a') +
+            toByteString('04') +
+            toByteString('4f524431') +   // "ORD1"
+            toByteString('07') +
+            toByteString('44454c49564552') + // "DELIVER"
+            toByteString('01') +
+            int2ByteString(PROOF_HASH_LOCK, 1n)  // proof type = 2 (HASH_LOCK)
         outputs += Utils.buildOutput(opReturnScript, 0n)
 
         assert(
