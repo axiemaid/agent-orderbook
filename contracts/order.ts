@@ -95,24 +95,23 @@ export class Order extends SmartContract {
     /**
      * FILL — any agent matches the order (partially or fully)
      *
-     * For ASK (seller): taker pays fillPrice >= order price → payment to maker
-     * For BID (buyer): taker delivers, fillPrice <= order price → payment from locked order value to taker
+     * For ASK: payment to maker from order UTXO value, taker adds separate funding input
+     * For BID: payment to taker from order UTXO value (buyer pre-locked)
      *
-     * Partial fills: remaining quantity continues as new order UTXO (output 1)
-     * Full fills: no continuation output
-     *
-     * Outputs:
-     *   [0] Payment to maker (ASK) or to taker (BID) — fillPrice × fillQuantity
-     *   [1] Remaining order UTXO (if partial fill, same covenant, reduced quantity)
+     * Outputs (in exact order):
+     *   [0] Payment P2PKH to maker (ASK) or taker (BID)
+     *   [1] Continuation covenant UTXO (if partial fill)
      *   [2] OP_RETURN: ORD1 FILL receipt
+     *   [3] Change P2PKH (any extra value from taker inputs, to taker)
      */
     @method()
     public fill(
         takerPkh: PubKeyHash,
         fillPrice: bigint,
         fillQuantity: bigint,
-        // Whether this is a partial fill (determines if continuation output is needed)
         isPartial: boolean,
+        changePkh: PubKeyHash,
+        changeAmount: bigint,
     ) {
         // Quantity must be positive and within remaining
         assert(fillQuantity > 0n, 'fill quantity must be positive')
@@ -136,6 +135,7 @@ export class Order extends SmartContract {
 
         let outputs: ByteString = toByteString('')
 
+        // Output 0: Payment P2PKH
         if (this.side == ASK) {
             // ASK: payment goes to maker (seller gets paid)
             outputs += Utils.buildPublicKeyHashOutput(this.makerPkh, paymentAmount)
@@ -144,32 +144,34 @@ export class Order extends SmartContract {
             outputs += Utils.buildPublicKeyHashOutput(takerPkh, paymentAmount)
         }
 
-        // Continuation output if partial fill
+        // Output 1: Continuation covenant UTXO (if partial fill)
         if (isPartial) {
-            // Remaining order value = price * remainingQuantity
             const remainingValue: bigint = this.price * this.remainingQuantity
             assert(remainingValue > 0n, 'remaining value must be positive')
             outputs += this.buildStateOutput(remainingValue)
         }
 
-        // OP_RETURN: "ORD1" "FILL" <order_txid_ref:0s for now> <fillPrice:8B> <fillQuantity:8B>
-        // Note: we can't reference our own txid in-script, so we use a placeholder
-        // The indexer resolves the order txid from the input being spent
+        // Output 2: OP_RETURN
         const opReturnScript: ByteString =
-            toByteString('006a') +                    // OP_FALSE OP_RETURN
-            toByteString('04') +                       // push 4 bytes
-            toByteString('4f524431') +                 // "ORD1"
-            toByteString('04') +                       // push 4 bytes
-            toByteString('46494c4c') +                 // "FILL"
-            toByteString('08') +                       // push 8 bytes
-            int2ByteString(fillPrice, 8n) +            // fill price LE
-            toByteString('08') +                       // push 8 bytes
-            int2ByteString(fillQuantity, 8n) +         // fill quantity LE
-            toByteString('01') +                       // push 1 byte
-            int2ByteString(this.orderType, 1n) +       // market type
-            toByteString('01') +                       // push 1 byte
-            int2ByteString(this.side, 1n)             // side
+            toByteString('006a') +
+            toByteString('04') +
+            toByteString('4f524431') +
+            toByteString('04') +
+            toByteString('46494c4c') +
+            toByteString('08') +
+            int2ByteString(fillPrice, 8n) +
+            toByteString('08') +
+            int2ByteString(fillQuantity, 8n) +
+            toByteString('01') +
+            int2ByteString(this.orderType, 1n) +
+            toByteString('01') +
+            int2ByteString(this.side, 1n)
         outputs += Utils.buildOutput(opReturnScript, 0n)
+
+        // Output 3: Change to taker (from their funding input)
+        if (changeAmount > 0n) {
+            outputs += Utils.buildPublicKeyHashOutput(changePkh, changeAmount)
+        }
 
         assert(
             this.ctx.hashOutputs == hash256(outputs),

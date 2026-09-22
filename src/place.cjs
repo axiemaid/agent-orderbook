@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// src/place.cjs — Place an ORD1 order on-chain
+// src/place.cjs — Place an ORD1 order on-chain (with real covenant UTXO)
 //
 // Usage: node src/place.cjs --wallet ~/.openclaw/bsv-wallet.json \
 //          --type COMPUTE --side ASK --price 50 --quantity 500 \
@@ -7,12 +7,14 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
+const { bsv } = require('scrypt-ts')
+const { Order } = require('../dist/contracts/order')
 const {
   loadWallet, getKeypair, wocBroadcast, getUtxos, getCurrentHeight,
-  generateNonce, sha256hex
+  generateNonce, sha256hex, wocGetRaw
 } = require('../lib/wallet.cjs')
-const { bsv } = require('scrypt-ts')
-const { MARKET_TYPES, SIDES, encodePlace } = require('../lib/protocol.cjs')
+const { MARKET_TYPES, SIDES, encodePlace, buildOpReturnScript } = require('../lib/protocol.cjs')
 
 // ─── Args ────────────────────────────────────────────────────────────
 
@@ -26,8 +28,8 @@ const TYPE_NAME = (args.type || 'COMPUTE').toUpperCase()
 const SIDE_NAME = (args.side || 'ASK').toUpperCase()
 const PRICE = parseInt(args.price)
 const QUANTITY = parseInt(args.quantity)
-const EXPIRY_OFFSET = parseInt(args.expiry || '1000') // blocks from now
-const AGENT_ID = args['agent-id'] || '' // REG1 txid hex (32 bytes)
+const EXPIRY_OFFSET = parseInt(args.expiry || '1000')
+const AGENT_ID = args['agent-id'] || ''
 
 if (!PRICE || !QUANTITY) {
   console.log('Usage: node src/place.cjs --wallet <path> --type COMPUTE --side ASK --price 50 --quantity 500 [--expiry 1000] [--agent-id <hex>]')
@@ -40,21 +42,32 @@ const SIDE = SIDES[SIDE_NAME]
 if (TYPE === undefined) { console.error(`Unknown type: ${TYPE_NAME}`); process.exit(1) }
 if (SIDE === undefined) { console.error(`Unknown side: ${SIDE_NAME}`); process.exit(1) }
 
+// ─── Load covenant artifact ──────────────────────────────────────────
+
+const artifact = require('../artifacts/contracts/order.json')
+Order.loadArtifact(artifact)
+
 // ─── Main ────────────────────────────────────────────────────────────
 
 async function place() {
-  console.log('📋 ORD1 — Place Order')
+  console.log('📋 ORD1 — Place Order (Covenant)')
   console.log(`   Type:     ${TYPE_NAME} (${TYPE})`)
   console.log(`   Side:     ${SIDE_NAME} (${SIDE})`)
   console.log(`   Price:    ${PRICE} sats/unit`)
   console.log(`   Quantity: ${QUANTITY}`)
-  console.log(`   Value:    ${(PRICE * QUANTITY).toLocaleString()} sats`)
+  const orderValue = PRICE * QUANTITY
+  console.log(`   Value:    ${orderValue.toLocaleString()} sats`)
   console.log()
 
   const wallet = loadWallet(WALLET_PATH)
-  const { privKey, pubKey, address, pubKeyHex } = getKeypair(wallet)
+  const { privKey, pubKey, address } = getKeypair(wallet)
+
+  const makerPubHex = pubKey.toString()
+  const makerPkh = address.hashBuffer.toString('hex')
 
   console.log(`   Address:  ${address.toString()}`)
+  console.log(`   PubKey:   ${makerPubHex.slice(0, 24)}...`)
+  console.log(`   Pkh:      ${makerPkh}`)
 
   // Get current height for expiry
   const currentHeight = await getCurrentHeight()
@@ -62,9 +75,22 @@ async function place() {
   console.log(`   Expiry:   Block ${expiryHeight} (current ${currentHeight} + ${EXPIRY_OFFSET})`)
 
   // Calculate order value and bond
-  const orderValue = PRICE * QUANTITY
   const bondAmount = Math.max(10000, Math.floor(orderValue * 0.05))
   console.log(`   Bond:     ${bondAmount} sats`)
+
+  // Create order covenant instance
+  const order = new Order(
+    makerPubHex,        // makerPub
+    makerPkh,           // makerPkh
+    BigInt(TYPE),       // orderType
+    BigInt(SIDE),       // side
+    BigInt(PRICE),      // price
+    BigInt(expiryHeight), // expiryHeight
+    BigInt(QUANTITY),   // remainingQuantity
+  )
+
+  const covenantScript = order.lockingScript
+  console.log(`   Covenant script: ${covenantScript.toHex().length / 2} bytes`)
 
   // Get UTXOs
   const utxos = await getUtxos(address.toString())
@@ -74,17 +100,17 @@ async function place() {
   }
 
   // Find a UTXO that covers order value + bond + fee
-  const totalNeeded = orderValue + bondAmount + 500 // 500 sat fee estimate
+  const feeEstimate = 1000 // covenant scripts are larger
+  const totalNeeded = orderValue + bondAmount + feeEstimate
   const utxo = utxos.find(u => u.satoshis >= totalNeeded)
   if (!utxo) {
     console.error(`❌ No single UTXO large enough (need ${totalNeeded} sats, largest: ${Math.max(...utxos.map(u => u.satoshis))})`)
     process.exit(1)
   }
 
-  // If no script, fetch it from the tx
+  // Fetch script for the UTXO if not available
   let utxoScript = utxo.script
   if (!utxoScript) {
-    const { wocGetRaw } = require('../lib/wallet.cjs')
     const txHex = await wocGetRaw(`/tx/${utxo.txid}/hex`)
     const bsvTx = new bsv.Transaction(txHex)
     utxoScript = bsvTx.outputs[utxo.vout].script.toHex()
@@ -99,16 +125,18 @@ async function place() {
     satoshis: utxo.satoshis,
   })
 
-  // Output 0: Order value to maker P2PKH (will be replaced by covenant in production)
-  // For now, P2PKH to self — the covenant script would lock this
-  tx.to(address, orderValue)
+  // Output 0: Order covenant UTXO (locked by covenant script)
+  tx.addOutput(new bsv.Transaction.Output({
+    script: covenantScript,
+    satoshis: orderValue,
+  }))
 
-  // Output 1: Bond to self (simplified — in production this would be bond covenant)
+  // Output 1: Bond (simplified — P2PKH to self, would be bond covenant in production)
   tx.to(address, bondAmount)
 
-  // Output 2: OP_RETURN — ORD1 PLACE (OP_FALSE OP_RETURN format for BSV)
-  const nonce = generateNonce(16)
-  const agentIdHex = AGENT_ID || '00'.repeat(20) // default: 20 zero bytes
+  // Output 2: OP_RETURN — ORD1 PLACE
+  const nonce = crypto.randomBytes(16).toString('hex')
+  const agentIdHex = AGENT_ID || '00'.repeat(20)
 
   const placeParts = encodePlace({
     type: TYPE,
@@ -117,11 +145,10 @@ async function place() {
     quantity: QUANTITY,
     agentId: agentIdHex,
     expiryHeight: expiryHeight,
-    bondRef: '00'.repeat(32), // will be set to txid after broadcast (indexer resolves)
+    bondRef: '00'.repeat(32),
     nonce: nonce,
   })
 
-  const { buildOpReturnScript } = require('../lib/protocol.cjs')
   const opReturnHex = buildOpReturnScript(placeParts)
   tx.addOutput(new bsv.Transaction.Output({
     script: bsv.Script.fromHex(opReturnHex),
@@ -129,16 +156,14 @@ async function place() {
   }))
 
   // Output 3: Change back to maker
-  const feeEstimate = 500
   const changeAmount = utxo.satoshis - orderValue - bondAmount - feeEstimate
-  if (changeAmount > 546) { // dust limit
+  if (changeAmount > 546) {
     tx.to(address, changeAmount)
   }
 
   // Sign
   tx.sign(privKey)
 
-  // Verify
   const txhex = tx.uncheckedSerialize()
   console.log(`   TX size:  ${txhex.length / 2} bytes`)
 
@@ -170,6 +195,7 @@ async function place() {
     placed_at_height: currentHeight,
     nonce,
     status: 'open',
+    covenant: true,
     fills: [],
   })
 
@@ -177,9 +203,9 @@ async function place() {
 
   console.log()
   console.log('═══════════════════════════════════════════════')
-  console.log(`   ✅ Order placed!`)
+  console.log(`   ✅ Order placed (covenant UTXO)!`)
   console.log(`   TXID:    ${txid}`)
-  console.log(`   Value:   ${orderValue.toLocaleString()} sats`)
+  console.log(`   Value:   ${orderValue.toLocaleString()} sats (locked in covenant)`)
   console.log(`   Bond:    ${bondAmount} sats`)
   console.log(`   Expiry:  Block ${expiryHeight}`)
   console.log(`   https://whatsonchain.com/tx/${txid}`)
