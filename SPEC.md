@@ -184,6 +184,71 @@ OP_RETURN (output [2]):
 | HASH_LOCK | 2 | Preimage revealed — delivery_data is SHA256 preimage matching delivery_hash |
 | ORACLE | 3 | Third-party oracle signs delivery confirmation (future) |
 
+### 5.6 BOUNTY (post task with locked sats)
+
+A simpler alternative to the orderbook flow. No FILL, no bonds, no delivery covenant. Just: lock sats with a task, anyone who claims gets paid.
+
+**Transaction structure:**
+```
+Inputs:
+  [0] Maker's funding UTXO (pays for reward + fees)
+
+Outputs:
+  [0] Bounty covenant UTXO (value = reward, locked by bounty covenant script)
+  [1] OP_RETURN: ORD1 BOUNTY receipt
+  [2] Change to maker (if any)
+
+OP_RETURN (output [1]):
+  OP_FALSE OP_RETURN "ORD1" "BOUNTY" <type:1B> <reward:8B LE uint64>
+  <expiry_height:4B LE uint32> <task:var>
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| type | 1 byte | Market type (§3) |
+| reward | 8 bytes LE | Reward in satoshis (locked in covenant UTXO) |
+| expiry_height | 4 bytes LE | Block height after which maker can reclaim |
+| task | variable | Task description (UTF-8 text — prompt, question, dataset hash, etc.) |
+
+The task is in the OP_RETURN for indexer discovery. The covenant script only manages payment release — it does not verify the answer.
+
+### 5.7 CLAIM (claim bounty reward)
+
+Any agent who computed the answer claims the reward in a single transaction.
+
+**Transaction structure:**
+```
+Inputs:
+  [0] Bounty covenant UTXO (spend via claim() path)
+
+Outputs:
+  [0] Payment to claimer (full reward)
+  [1] OP_RETURN: ORD1 CLAIM receipt (fixed)
+```
+
+The answer is passed as a method argument (`answer: ByteString`) — it goes into the input script witness, not the OP_RETURN. This keeps covenant outputs fixed-size regardless of answer length. Indexers extract the answer from the claim tx input.
+
+The covenant verifies only:
+- Valid claimer signature
+- Correct output structure (payment to claimer P2PKH + fixed OP_RETURN)
+
+No answer verification on-chain. Quality is enforced at the reputation layer — indexers track claim history, future bounties can filter by reputation.
+
+### 5.8 BOUNTY TIMEOUT (reclaim expired bounty)
+
+If nobody claims the bounty before expiry, the maker reclaims.
+
+```
+Inputs:
+  [0] Bounty covenant UTXO (timeout path)
+
+Outputs:
+  [0] Full refund to maker
+  [1] OP_RETURN: ORD1 TIMEOUT
+```
+
+Requires: current block height ≥ expiry_height + GRACE_BLOCKS.
+
 ---
 
 ## 6. Covenant Script: Order UTXO
