@@ -32,6 +32,8 @@ function loadIndex() {
     const initial = {
       open_orders: [],
       filled_orders: [],
+      open_bounties: [],
+      claimed_bounties: [],
       deliveries: [],
       disputes: [],
       last_scanned_height: 0,
@@ -85,6 +87,7 @@ async function scanMempool(index, stats) {
   // WoC doesn't expose a full mempool tx list.
   // Instead, check unconfirmed txids from our local state.
   const orderFile = path.join(__dirname, '..', 'state', 'orders.json')
+  const bountyFile = path.join(__dirname, '..', 'state', 'bounties.json')
   let knownTxids = []
   if (fs.existsSync(orderFile)) {
     const orders = JSON.parse(fs.readFileSync(orderFile, 'utf8'))
@@ -94,6 +97,13 @@ async function scanMempool(index, stats) {
         knownTxids.push(...order.fills.map(f => f.txid).filter(Boolean))
       }
     }
+  }
+  // Also track bounty txids + claim txids
+  if (fs.existsSync(bountyFile)) {
+    const bounties = JSON.parse(fs.readFileSync(bountyFile, 'utf8'))
+    knownTxids.push(...bounties.map(b => b.txid).filter(Boolean))
+    knownTxids.push(...bounties.map(b => b.claim_txid).filter(Boolean))
+    knownTxids.push(...bounties.map(b => b.timeout_txid).filter(Boolean))
   }
 
   let found = 0
@@ -110,12 +120,13 @@ async function scanMempool(index, stats) {
     try {
       const { bsv } = require('scrypt-ts')
       const tx = new bsv.Transaction(txHex)
-      for (const output of tx.outputs) {
+      for (let oi = 0; oi < tx.outputs.length; oi++) {
+        const output = tx.outputs[oi]
         const scriptHex = output.script.toHex()
         const parsed = decodeOrd1(scriptHex)
         if (!parsed) continue
         found++
-        processOrd1Tx(parsed, txid, output, index, stats, -1)
+        processOrd1Tx(parsed, txid, output, index, stats, -1, tx)
       }
     } catch (e) {
       // skip unparseable txs
@@ -139,13 +150,14 @@ async function scanBlock(height, index, stats) {
       const { bsv } = require('scrypt-ts')
       const tx = new bsv.Transaction(txHex)
 
-      for (const output of tx.outputs) {
+      for (let oi = 0; oi < tx.outputs.length; oi++) {
+        const output = tx.outputs[oi]
         const scriptHex = output.script.toHex()
         const parsed = decodeOrd1(scriptHex)
         if (!parsed) continue
 
         found++
-        processOrd1Tx(parsed, txid, output, index, stats, height)
+        processOrd1Tx(parsed, txid, output, index, stats, height, tx)
       }
     } catch (e) {
       // skip unparseable txs
@@ -155,7 +167,7 @@ async function scanBlock(height, index, stats) {
   return found
 }
 
-function processOrd1Tx(parsed, txid, output, index, stats, height) {
+function processOrd1Tx(parsed, txid, output, index, stats, height, txObj) {
   switch (parsed.action) {
     case 'PLACE': {
       // Check if we already have this order
@@ -246,18 +258,93 @@ function processOrd1Tx(parsed, txid, output, index, stats, height) {
       break
     }
 
+    case 'BOUNTY': {
+      // Check if already indexed
+      const bountyExists = index.open_bounties?.find(b => b.txid === txid)
+      if (bountyExists) break
+
+      if (!index.open_bounties) index.open_bounties = []
+      if (!index.claimed_bounties) index.claimed_bounties = []
+
+      index.open_bounties.push({
+        txid,
+        type: parsed.type,
+        reward: parsed.reward,
+        task: parsed.task,
+        expiry_height: parsed.expiryHeight,
+        placed_at_height: height,
+        status: 'open',
+      })
+
+      console.log(`  🎯 BOUNTY: ${parsed.reward} sats — ${parsed.task?.slice(0, 60)}... (${txid.slice(0, 16)}...)`)
+      break
+    }
+
+    case 'CLAIM': {
+      // The bounty txid is in the input (prev txid of input[0])
+      // The answer is in the input script witness
+      let bountyTxid = parsed.bountyTxid
+      let answer = parsed.answer
+
+      // Extract from input if available
+      if (txObj && txObj.inputs && txObj.inputs.length > 0) {
+        const input = txObj.inputs[0]
+        bountyTxid = input.prevTxId.toString('hex') || bountyTxid
+        // Extract answer from input script witness
+        // sCrypt pushes method args in the input script. For claim(claimerPub, claimerSig, claimerPkh, answer)
+        // the chunks are: [0] pubKey(33B) [1] sig(~70B) [2] pkh(20B) [3] answer [4] covenant script
+        // The answer is the chunk that's not a sig/pubkey/pkh/covenant — try chunks 0-3
+        try {
+          const chunks = input.script.chunks || []
+          for (let ci = 0; ci < chunks.length; ci++) {
+            const c = chunks[ci]
+            if (!c.buf || c.buf.length === 0) continue
+            // Skip known sizes: pubKey(33), sig(~70-72), pkh(20), covenant(>100)
+            const len = c.buf.length
+            if (len === 33 || len === 20 || len > 100) continue
+            // Check if it looks like a signature (starts with 0x30)
+            if (c.buf[0] === 0x30 && len > 60) continue
+            // This should be the answer
+            answer = c.buf.toString('utf8')
+            break
+          }
+        } catch (e) {}
+      }
+
+      const bounty = index.open_bounties?.find(b => b.txid === bountyTxid)
+      if (bounty) {
+        bounty.status = 'claimed'
+        bounty.claim_txid = txid
+        bounty.answer = answer
+        bounty.claimed_at_height = height
+        index.claimed_bounties = index.claimed_bounties || []
+        index.claimed_bounties.push({ ...bounty })
+        index.open_bounties = index.open_bounties.filter(b => b.txid !== bountyTxid)
+      }
+      console.log(`  ✅ CLAIM: ${answer?.slice(0, 60)}... for ${bountyTxid?.slice(0, 16)}...`)
+      break
+    }
+
     case 'REFUND':
       console.log(`  💰 REFUND: ${txid.slice(0, 16)}...`)
       break
 
-    case 'TIMEOUT':
-      const order = index.open_orders.find(o => o.txid === txid)
-      if (order) {
-        order.status = 'timeout'
-        index.open_orders = index.open_orders.filter(o => o.txid !== txid)
+    case 'TIMEOUT': {
+      // Check bounties first, then orders
+      const bounty = index.open_bounties?.find(b => b.txid === txid)
+      if (bounty) {
+        bounty.status = 'timeout'
+        index.open_bounties = index.open_bounties.filter(b => b.txid !== txid)
+      } else {
+        const order = index.open_orders.find(o => o.txid === txid)
+        if (order) {
+          order.status = 'timeout'
+          index.open_orders = index.open_orders.filter(o => o.txid !== txid)
+        }
       }
       console.log(`  ⏰ TIMEOUT: ${txid.slice(0, 16)}...`)
       break
+    }
   }
 }
 
@@ -334,6 +421,8 @@ async function main() {
   console.log(`   ORD1 txs found: ${totalFound}`)
   console.log(`   Open orders:    ${index.open_orders.length}`)
   console.log(`   Filled orders:  ${index.filled_orders.length}`)
+  console.log(`   Open bounties: ${(index.open_bounties || []).length}`)
+  console.log(`   Claimed:        ${(index.claimed_bounties || []).length}`)
   console.log(`   Deliveries:     ${index.deliveries.length}`)
   console.log(`   Disputes:       ${index.disputes.length}`)
   console.log()
@@ -344,6 +433,15 @@ async function main() {
     for (const o of index.open_orders) {
       const sideName = o.side === 1 ? 'ASK' : 'BID'
       console.log(`     ${sideName} ${o.remaining_quantity}/${o.quantity} @ ${o.price} sats (${o.txid.slice(0, 16)}...)`)
+    }
+  }
+
+  // Show open bounties summary
+  if ((index.open_bounties || []).length > 0) {
+    console.log()
+    console.log('   Open Bounties:')
+    for (const b of index.open_bounties) {
+      console.log(`     ${b.reward} sats — ${b.task?.slice(0, 60)}... (${b.txid.slice(0, 16)}...)`)
     }
   }
 

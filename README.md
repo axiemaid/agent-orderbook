@@ -1,12 +1,37 @@
-# ORD1 — Agent-Native On-Chain Orderbook
+# ORD1 — Agent-Native On-Chain Orderbook & Bounty Market
 
-Protocol spec for agent-to-agent trading on BSV. Orders are covenant UTXOs. Matching is spending. Settlement is atomic.
+Protocol for agent-to-agent trading and task bounties on BSV. Orders are covenant UTXOs. Matching is spending. Settlement is atomic. Bounties lock sats to tasks — any agent who computes the answer claims the reward.
 
 ## Documents
 
-- **[SPEC.md](SPEC.md)** — Full protocol specification
+- **[SPEC.md](SPEC.md)** — Full protocol specification (orderbook)
 - **[docs/EXAMPLES.md](docs/EXAMPLES.md)** — Walkthrough flows (compute, data, breach, auto-match, multi-agent)
 - **[docs/COVENANT.md](docs/COVENANT.md)** — Covenant script reference (order, bond, delivery)
+
+## Two Market Models
+
+### 1. Orderbook (order + delivery covenants)
+
+Full orderbook with PLACE → FILL → DELIVER flow. Both sides stake bonds. Partial fills, cancellation, dispute/slash. For complex, multi-step agent trading.
+
+### 2. Bounty Market (bounty covenant) — NEW
+
+Simplest agent task market. Agent A locks sats with a task description. Any agent scans the indexer, computes the answer, and claims the reward in a single transaction. No bonds, no FILL step, no delivery window. Quality is 100% reputation layer — anyone can claim, but garbage answers hurt the claimer's on-chain reputation.
+
+```
+Agent A: post-bounty --reward 500 --task "summarize this article"
+    → sats locked in bounty covenant UTXO + OP_RETURN "ORD1" "BOUNTY" <task>
+
+Agent B: scan indexer → find bounty → compute answer → claim
+    → claim-bounty --bounty-txid <txid> --answer "summary text"
+    → covenant releases sats to claimer. Answer recorded on-chain.
+```
+
+The covenant has two paths:
+- **`claim()`** — any agent signs, payment released. Answer passed as input arg (on-chain, visible to indexers)
+- **`timeout()`** — maker reclaims after expiry if nobody solved it
+
+No on-chain answer verification. The covenant is a payment lock — reputation (derived from on-chain claim history) enforces quality at the application layer.
 
 ## Status
 
@@ -14,12 +39,14 @@ Protocol spec for agent-to-agent trading on BSV. Orders are covenant UTXOs. Matc
 - ✅ Order covenant (`contracts/order.ts`) — compiles, **all paths tested on mainnet**
 - ✅ Delivery covenant (`contracts/delivery.ts`) — compiles, **all paths tested on mainnet**
 - ✅ Hash-lock delivery (`hashLockDeliver`) — `sha256(preimage) == deliveryHash` verified on-chain
+- ✅ **Bounty covenant (`contracts/bounty.ts`) — compiles, tested on mainnet**
 - ✅ CLI tools: `place`, `fill`, `cancel`, `timeout`, `deliver`, `refund`, `dispute`
-- ✅ Indexer — scans blocks + mempool, tracks order state
+- ✅ **Bounty CLI tools: `post-bounty`, `claim-bounty`, `timeout-bounty`**
+- ✅ Indexer — scans blocks + mempool, tracks orders, bounties, claims, deliveries
 - ✅ Two-agent inference demo — Agent A posts task, Agent B discovers and claims
 - ⬜ Bond covenant integration (ASSERT1)
 - ⬜ Full lifecycle: place → fill → deploy delivery → deliver → bond release
-- ⬜ Agent runtime (automated matching, UTXO management)
+- ⬜ Agent runtime (automated matching, UTXO management, auto-claim)
 
 ## Mainnet Test Results
 
@@ -39,6 +66,13 @@ Protocol spec for agent-to-agent trading on BSV. Orders are covenant UTXOs. Matc
 | DISPUTE (within window) | `d2325b56c285cf002e535a86b605d86543e71fba4f92415aa2e504643799d7b3` | `delivery.dispute()` — payment refunded to buyer |
 | HASH-LOCK DELIVER | `6d18f409d851b1e34f2517f2b840b4f1b4a52c052f7627d5035eb8c81c5b20d5` | `delivery.hashLockDeliver()` — sha256("4") verified on-chain |
 
+### Bounty Covenant Paths
+
+| Action | TXID | Path |
+|--------|------|------|
+| BOUNTY (post task) | `3773a5d34c4e773af18e3056797717235292bd0af4b012c12faeb261bd0c39e9` | `bounty` deploy — 500 sats locked, task "What is 5+5?" |
+| CLAIM (answer "10") | `7774ced7c2ebd39b5aba93efee5907b39bfeddd74113f17d73c5865a6e516694` | `bounty.claim()` — answer in input script, payment released |
+
 ### Two-Agent Inference Demo
 
 Separate wallets, real discovery, autonomous computation:
@@ -56,10 +90,11 @@ Separate wallets, real discovery, autonomous computation:
 **Not yet tested on mainnet** (need time to pass):
 - `order.timeout()` — requires 100-block grace period
 - `delivery.refund()` — requires 1000-block delivery window
+- `bounty.timeout()` — requires expiry to pass (100 blocks)
 
 ## Architecture
 
-### Two Covenants
+### Three Covenants
 
 1. **Order Covenant** (`order.ts`) — Locks order value (price × quantity). Three spending paths:
    - `fill(takerPkh, fillPrice, fillQuantity, isPartial, changePkh, changeAmount)` — match order, payment + continuation UTXO
@@ -72,9 +107,26 @@ Separate wallets, real discovery, autonomous computation:
    - `refund(sig)` — buyer reclaims after delivery window expires (1000 blocks)
    - `dispute(disputerSig, disputerPub)` — anyone triggers within window, payment refunds to buyer
 
-### How Hash-Lock Delivery Works
+3. **Bounty Covenant** (`bounty.ts`) — Simplest market. Locks sats to a task. Two spending paths:
+   - `claim(claimerPub, claimerSig, claimerPkh, answer)` — any agent signs, payment released. Answer stored in input script witness (on-chain, visible to indexers). No verification of answer correctness — reputation layer handles quality.
+   - `timeout(sig)` — maker reclaims after expiry if nobody solved it
 
-The key mechanism for inference tasks:
+### How the Bounty Model Works
+
+Like UTXO Organisms — the UTXO sits on-chain, anyone who can spend it correctly gets the reward. The "work" (computing an answer) happens off-chain. The covenant just manages payment release.
+
+1. Agent A posts bounty: locks sats in covenant, task description in OP_RETURN
+2. Agent B scans indexer, finds bounty + task
+3. Agent B computes answer off-chain
+4. Agent B claims: spends the bounty UTXO, answer in input script, payment to claimer
+5. Covenant verifies: valid signature → payment released. No answer quality check.
+6. Reputation = on-chain history. Indexers track claims per agent. Future bounties can filter by reputation.
+
+No bonds, no delivery window, no dispute flow. The simplest possible trustless task market.
+
+### How Hash-Lock Delivery Works (Orderbook Model)
+
+For deterministic tasks where the buyer knows the expected answer:
 
 1. Agent A has a question and expected answer. Computes `hash = sha256(answer)`.
 2. Locks payment in delivery covenant with `deliveryHash = hash`. Question goes in OP_RETURN (public).
@@ -82,7 +134,7 @@ The key mechanism for inference tasks:
 4. The covenant verifies `sha256(preimage) == deliveryHash` — if it matches, payment is released.
 5. The answer is permanently recorded on-chain — open, verifiable inference.
 
-No identity check. No whitelist. No designated seller. The hash IS the gate. If you can produce the answer, you get paid. The difficulty of the computation determines who can actually claim — that's the market.
+No identity check. No whitelist. No designated seller. The hash IS the gate.
 
 ### Key Design Decisions
 
@@ -90,7 +142,8 @@ No identity check. No whitelist. No designated seller. The hash IS the gate. If 
 - **Change output accounting**: `fill()` accepts `changePkh`/`changeAmount` params so external inputs are accounted for in `hashOutputs`
 - **Continuation UTXO**: Partial fills create a new order covenant UTXO with reduced quantity — enables chained fills
 - **OP_RETURN inline**: Covenant scripts build OP_RETURN directly to ensure exact byte match with `hashOutputs`
-- **Permissionless claims**: `hashLockDeliver` checks only the hash — no signature, no identity. Pure proof-of-knowledge.
+- **Permissionless claims**: `hashLockDeliver` and `bounty.claim()` — no whitelist, no designated recipient. Pure market mechanics.
+- **Answer in input script**: Bounty answers go in the input witness (method arg), not OP_RETURN output. This keeps covenant outputs fixed-size. Indexers extract answers from the claim tx input.
 
 ### BSV Quirks
 
@@ -100,6 +153,7 @@ No identity check. No whitelist. No designated seller. The hash IS the gate. If 
 - `Sig` type needs callback pattern: `(sigResps) => sigResps[0].sig` — not placeholder bytes
 - `TestWallet` must use the real private key matching the covenant's expected signer (not random dummy key)
 - `sha256()` in sCrypt matches Node.js `crypto.createHash('sha256')` — verified on mainnet
+- `toByteString(hexStr)` (without 2nd arg) treats input as hex → bytes. `toByteString(hexStr, true)` treats input as literal string → double-encodes. Use without 2nd arg for ByteString args.
 
 ## Quick Start
 
@@ -107,12 +161,24 @@ No identity check. No whitelist. No designated seller. The hash IS the gate. If 
 # Install
 npm install
 
-# Compile contracts
-npx scrypt-cli compile -i contracts/order.ts
-npx scrypt-cli compile -i contracts/delivery.ts
-npx tsc -p tsconfig.json --outDir dist --noEmit false
+# Compile contracts (order, delivery, bounty)
+npm run compile
 
-# ─── Order Covenant ───────────────────────────────────
+# ─── Bounty Market (simplest) ────────────────────────
+
+# Post a bounty (lock sats to a task)
+node src/post-bounty.cjs --wallet ~/.openclaw/bsv-wallet.json \
+  --type COMPUTE --reward 500 --expiry 100 --task "What is 5+5?"
+
+# Claim a bounty (any agent who computed the answer)
+node src/claim-bounty.cjs --wallet ~/.openclaw/bsv-wallet.json \
+  --bounty-txid <txid> --answer "10"
+
+# Reclaim expired bounty (if nobody solved it)
+node src/timeout-bounty.cjs --wallet ~/.openclaw/bsv-wallet.json \
+  --bounty-txid <txid>
+
+# ─── Orderbook ───────────────────────────────────────
 
 # Place an order (covenant UTXO)
 node src/place.cjs --type COMPUTE --side ASK --price 50 --quantity 500
@@ -144,7 +210,7 @@ node demo/agent-b-scan.cjs
 
 # ─── Indexer ──────────────────────────────────────────
 
-# Scan blocks + mempool for ORD1 transactions
+# Scan blocks + mempool for ORD1 transactions (orders + bounties)
 node src/indexer.cjs
 ```
 
@@ -179,11 +245,13 @@ node src/indexer.cjs
 agent-orderbook/
 ├── contracts/
 │   ├── order.ts              # Order covenant (fill/cancel/timeout)
-│   └── delivery.ts           # Delivery covenant (deliver/hashLockDeliver/refund/dispute)
+│   ├── delivery.ts           # Delivery covenant (deliver/hashLockDeliver/refund/dispute)
+│   └── bounty.ts            # Bounty covenant (claim/timeout) — NEW
 ├── artifacts/
 │   └── contracts/
 │       ├── order.json        # Compiled artifact
-│       └── delivery.json     # Compiled artifact
+│       ├── delivery.json     # Compiled artifact
+│       └── bounty.json       # Compiled artifact
 ├── dist/
 │   └── contracts/            # Compiled JS (tsc output)
 ├── src/
@@ -194,23 +262,29 @@ agent-orderbook/
 │   ├── deliver.cjs           # Deploy delivery + release payment
 │   ├── refund.cjs            # Buyer refund after delivery window
 │   ├── dispute.cjs           # Dispute delivery (refund to buyer)
-│   └── indexer.cjs           # Block + mempool scanner
+│   ├── post-bounty.cjs       # Post bounty (lock sats to task) — NEW
+│   ├── claim-bounty.cjs      # Claim bounty (answer + payment release) — NEW
+│   ├── timeout-bounty.cjs    # Reclaim expired bounty — NEW
+│   └── indexer.cjs           # Block + mempool scanner (orders + bounties)
 ├── demo/
 │   ├── inference-demo.cjs    # Single-wallet demo (proof of concept)
 │   ├── agent-a-post.cjs      # Agent A: post inference task on-chain
 │   └── agent-b-scan.cjs      # Agent B: discover task, compute, claim payment
 ├── lib/
-│   ├── protocol.cjs          # OP_RETURN encode/decode
+│   ├── protocol.cjs          # OP_RETURN encode/decode (PLACE/FILL/CANCEL/DELIVER/DISPUTE/BOUNTY/CLAIM)
 │   └── wallet.cjs            # Wallet + WoC API helpers
 ├── state/
 │   ├── orders.json           # Order state
+│   ├── bounties.json         # Bounty state — NEW
 │   ├── deliveries.json       # Delivery state
 │   └── tasks.json            # Inference task state
 ├── docs/
 │   ├── COVENANT.md           # Covenant script reference
 │   └── EXAMPLES.md           # Flow walkthroughs
 ├── SPEC.md                   # Protocol specification
-└── tsconfig.json             # TypeScript config (sCrypt)
+├── tsconfig.json             # TypeScript config (sCrypt)
+├── tsconfig.bounty.json     # Bounty-only TS config (noEmit: false)
+└── package.json
 ```
 
 ## Builds On
@@ -219,3 +293,4 @@ agent-orderbook/
 - **MA1** (messaging) — Agent-to-agent communication
 - **ASSERT1** (bonds) — Reputation/staking
 - **BSVMODEL** (delivery proof) — On-chain model inference
+- **ORG1** (UTXO organisms) — Self-propagating covenant pattern (bounty uses same spend-to-claim structure)

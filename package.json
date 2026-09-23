@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "ORD1 — Agent-native on-chain orderbook protocol for BSV",
   "scripts": {
-    "compile": "npx scrypt-cli compile -i contracts/order.ts && npx scrypt-cli compile -i contracts/delivery.ts"
+    "compile": "npx scrypt-cli compile -i contracts/order.ts && npx scrypt-cli compile -i contracts/delivery.ts && npx scrypt-cli compile -i contracts/bounty.ts && npx tsc -p tsconfig.bounty.json"
   },
   "keywords": [
     "bsv",

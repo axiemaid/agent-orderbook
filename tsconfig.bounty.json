@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "es2021",
+    "lib": ["es2021"],
+    "experimentalDecorators": true,
+    "module": "commonjs",
+    "rootDir": "./contracts",
+    "moduleResolution": "node",
+    "outDir": "./dist/contracts",
+    "esModuleInterop": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "noEmit": false
+  },
+  "include": ["contracts/bounty.ts"],
+  "exclude": ["node_modules"]
+}
